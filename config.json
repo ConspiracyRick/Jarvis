@@ -1,0 +1,9 @@
+{
+  "user_name": "Sir",
+  "leviton_email": "your-email",
+  "leviton_password": "your-password",
+  "ring_email": "your-email",
+  "ring_password": "your-password",
+  "weather_api_key": "paste-your-key-here",
+  "location": "your-location"
+}

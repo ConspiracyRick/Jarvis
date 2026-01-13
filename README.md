@@ -27,4 +27,4 @@ Modern • Powerful • Customizable
 ### Core Libraries
 
 ```bash
-pip install speechrecognition pyttsx3 pyaudio requests python-dotenv
+pip install speechrecognition pyttsx3 pyaudio requests beautifulsoup4 num2words

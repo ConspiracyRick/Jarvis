@@ -5,14 +5,13 @@ import sys
 import json
 import os
 import time
-import webbrowser
 import urllib.request
 import requests
 from pathlib import Path
-import asyncio  # For Ring async login
-from queue import Queue
-import threading
 import re
+import urllib.parse
+from bs4 import BeautifulSoup
+import webbrowser
 
 # === Leviton ===
 try:
@@ -61,7 +60,46 @@ class AI:
         engine.say(text)
         engine.runAndWait()
         engine.stop()  # release resources
+    
+    
+    # ====== BACKGROUND LISTENING ======
+    def start_background_listen(self):
+        # Adjust for ambient noise once at startup
+        with self.mic as source:
+            print("Calibrating microphone for ambient noise...")
+            self.r.adjust_for_ambient_noise(source, duration=3)
+            self.r.dynamic_energy_threshold = True
+            print("Calibration done!")
 
+        # Define the callback for background listening
+        def callback(recognizer, audio):
+            try:
+                q = recognizer.recognize_google(audio)
+                print(f"You: {q}")
+                if "jarvis" in q.lower():
+                    cmd = q.lower().replace("jarvis", "").strip()
+                    if cmd:
+                        self.respond(cmd)
+                    else:
+                        self.speak("Yes, Sir?")
+            except sr.UnknownValueError:
+                # Could not understand audio, ignore
+                pass
+            except Exception as e:
+                print(f"Speech recognition error: {e}")
+
+        # Start background listening
+        self.background_listening = self.r.listen_in_background(
+            self.mic, callback, phrase_time_limit=20
+        )
+        print("Jarvis is now listening in the background...")
+
+    # ====== STOP BACKGROUND LISTENING ======
+    def stop_background_listen(self):
+        if self.background_listening:
+            self.background_listening(wait_for_stop=False)
+            print("Background listening stopped.")
+    
     def load_config(self):
         try:
             with open("config.json") as f:
@@ -112,38 +150,55 @@ class AI:
         if any(phrase in q for phrase in ["list my lights", "what lights", "show lights"]):
             if self.leviton_switches:
                 names = ", ".join([s.name for s in self.leviton_switches.values()])
+                print(names)
                 self.speak(f"Your lights are: {names}")
             else:
                 self.speak("No Leviton lights found.")
             return True
 
-        # Find target device(s)
-        target_switch = None
-        for name, switch in self.leviton_switches.items():
-            if name in q:  # matches full name or substring
-                target_switch = switch
-                break
+        # Normalize query: remove plurals and convert numbers to digits
+        q_norm = q.replace("switches", "switch")  # singularize
+        for word, digit in [("one", "1"), ("two", "2"), ("three", "3"),
+                            ("four", "4"), ("five", "5"), ("six", "6"),
+                            ("seven", "7"), ("eight", "8"), ("nine", "9")]:
+            q_norm = q_norm.replace(word, digit)
 
-        # All lights if no specific name or "all"/"every"
-        if not target_switch or any(word in q for word in ["all", "every", "whole house"]):
+        targets = []
+        target_names = []
+
+        # Check for "all"
+        if any(word in q_norm for word in ["all", "every", "whole house"]):
             targets = list(self.leviton_switches.values())
-            target_name = "all lights"
+            target_names = ["all lights"]
         else:
-            targets = [target_switch]
-            target_name = target_switch.name
+            # Try to match device names
+            for name, switch in self.leviton_switches.items():
+                # Normalize the switch name too
+                name_norm = name.lower().replace(" ", "")
+                q_check = q_norm.replace(" ", "")
+                if name_norm in q_check or q_check in name_norm:
+                    targets.append(switch)
+                    target_names.append(switch.name)
+
+        if not targets:
+            return False
+
+        target_name = ", ".join(target_names)
 
         # Turn on/off
-        if any(phrase in q for phrase in ["turn on", "on ", "activate"]):
+        if any(phrase in q for phrase in ["turn on", "on", "activate"]):
             for t in targets:
                 t.update_attributes({"power": "ON"})
-            self.speak(f"Turning on {target_name}")
+            #self.speak(f"Turning on {target_name}")
             return True
 
-        if any(phrase in q for phrase in ["turn off", "off ", "deactivate"]):
+        if any(phrase in q for phrase in ["turn off", "off", "deactivate"]):
             for t in targets:
                 t.update_attributes({"power": "OFF"})
-            self.speak(f"Turning off {target_name}")
+            #self.speak(f"Turning off {target_name}")
             return True
+
+        return False
 
         # Brightness
         match = re.search(r'(?:to|at)\s*(\d+)\s*%?', q)
@@ -214,6 +269,7 @@ class AI:
                 names = ", ".join(d.name for d in self.ring_devices)
                 #print(f"Ring connected. {count} cameras online.")
                 #print(f"Ring devices: {names}")
+                print(f"Ring devices: {self.ring_devices}")
                 self.ringlogin_ok = True
             #else:
                 #self.speak("Ring connected but no cameras detected.")
@@ -224,18 +280,30 @@ class AI:
 
     def listen(self):
         with self.mic as source:
-            print("Listening...")  # ← visual feedback
-            self.r.adjust_for_ambient_noise(source, duration=1)  # ← longer calibration
-            self.r.energy_threshold = 600  # ← lower = more sensitive (tune if needed)
+            print("Listening...")
+            self.r.adjust_for_ambient_noise(source, duration=3)  # longer calibration
+            self.r.energy_threshold = 100                     # lower = more sensitive
+            self.r.dynamic_energy_threshold = True            # auto-adjust threshold
+
             try:
-                audio = self.r.listen(source, phrase_time_limit=100, timeout=60)
+                audio = self.r.listen(source, timeout=10, phrase_time_limit=20)
             except sr.WaitTimeoutError:
+                print("Listening timed out.")
                 return ""
-        
+
         try:
-            q = self.r.recognize_google(audio, language="en-US")
-            print(f"You: {q}")
-            return q.lower()
+            results = self.r.recognize_google(audio, language="en-US", show_all=True)
+            if results:
+                # Google returns alternatives; pick the most confident
+                if isinstance(results, dict) and "alternative" in results:
+                    best_guess = results["alternative"][0]["transcript"]
+                else:
+                    best_guess = str(results)
+            else:
+                best_guess = ""
+
+            print(f"You: {best_guess}")
+            return best_guess.lower()
         except sr.UnknownValueError:
             print("Could not understand audio")
             return ""
@@ -243,21 +311,23 @@ class AI:
             print(f"Speech recognition error: {e}")
             return ""
 
+
     def handle_ring(self, q):
         if not self.ring_devices: return False
         q = q.lower()
+        keywords = {"live", "stream", "show"}
         device = next((d for d in self.ring_devices if d.name.lower() in q), None)
         if not device:
             self.speak("No Ring device found.")
             return True
-        if "live" in q or "stream" in q:
+        if any(kw in q.lower() for kw in keywords):
             self.speak(f"Opening live view from {device.name}")
             try:
                 # Fallback to Ring web URL if video_url() fails
-                video_url = f"https://account.ring.com/account/dashboard/{device.id}"
-                webbrowser.open(device.video_url())
+                url = f"https://account.ring.com/account/dashboard/?lv_d={device.id}"
+                webbrowser.open(url)
             except:
-                self.speak("Live view unavailable. You need a ing subscription to access this.")
+                self.speak("Live view unavailable. You need a ring subscription to access this.")
             return True
         if "snapshot" in q:
             try:
@@ -271,6 +341,77 @@ class AI:
             return True
         return False
     
+    def web_fallback_answer(self, query):
+        try:
+            print(f"🔍 Searching for: {query}")
+
+            # ===== 0. Try to evaluate math expressions first =====
+            math_expr = re.findall(r'[\d\.\+\-\*\/\^\(\) ]+', query)
+            if math_expr:
+                try:
+                    expr = "".join(math_expr)
+                    result = eval(expr)
+                    print("Answer (Math):", result)
+                    self.speak(f"The answer is {result}")
+                    return True
+                except:
+                    pass  # Not a valid math expression, continue
+
+            # ===== 1. DuckDuckGo Instant Answer API =====
+            ddg_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1&skip_disambig=1"
+            r = requests.get(ddg_url, timeout=5)
+            data = r.json()
+
+            if data.get("AbstractText"):
+                answer = data["AbstractText"]
+                print("Answer (DDG API):", answer)
+                self.speak(answer)
+                return True
+
+            # Try related topics
+            for topic in data.get("RelatedTopics", []):
+                if isinstance(topic, dict) and topic.get("Text"):
+                    answer = topic["Text"]
+                    print("Answer (DDG topic):", answer)
+                    self.speak(answer)
+                    return True
+
+            # ===== 2. Wikipedia API =====
+            wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+            r = requests.get(wiki_url, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if "extract" in data and len(data["extract"]) > 50:
+                    answer = data["extract"]
+                    print("Answer (Wikipedia):", answer)
+                    self.speak(answer)
+                    return True
+
+            # ===== 3. Google search fallback =====
+            print("No API answer found, trying Google HTML search...")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            }
+            google_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
+            r = requests.get(google_url, headers=headers, timeout=5)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Try featured snippet
+            snippet = soup.select_one("div[data-attrid='wa:/description'], div[data-tts='answers'], div.BNeawe.iBp4i.AP7Wnd")
+            if snippet:
+                answer = snippet.get_text()
+                print("Answer (Google snippet):", answer)
+                self.speak(answer)
+                return True
+
+            # Final fallback
+            self.speak("I couldn't find a direct answer, but you can check online.")
+            return True
+
+        except Exception as e:
+            print("Web lookup failed:", e)
+            self.speak("I couldn't reach the internet.")
+            return False
     
     def loaded(self):
         #print("Starting......\n")
@@ -301,28 +442,22 @@ class AI:
         # Final status
         if self.levitonlogin_ok and self.ringlogin_ok:
             print("All systems operational!")
-            self.speak("All systems operational, Sir.")
+            self.speak("All systems operational.")
         else:
             print("Partial systems online.")
             self.speak("Systems partially operational.")
         
     def respond(self, q):
         q = q.lower()
-        # === LEVITON LIGHTS (THIS WAS MISSING!) ===
+        # === LEVITON LIGHTS ===
         if self.handle_leviton_command(q):
             return
         
-        # === RING CAMERAS — THIS WAS MISSING! ===
-        if self.handle_ring(q):
-            return
-        
-        if "list cameras" in q or "show cameras" in q or "list ring" in q:
-            if self.ring_devices:
-                names = ", ".join([d.name for d in self.ring_devices])
-                self.speak(f"Your cameras: {names}")
-            else:
-                self.speak("No cameras found.")
-            return True        
+        # === RING CAMERAS ===
+        keywords = {"live", "stream", "show"}
+        if any(kw in q.lower() for kw in keywords):
+            if self.handle_ring(q):
+                return     
             
         if "how are you" in q:
             print("Fully operational, Sir.")
@@ -335,7 +470,7 @@ class AI:
             self.speak("Good night, Sir.")
             exit()
         else:
-            self.speak("Awaiting your command.")
+            self.web_fallback_answer(q)
 
     def run(self):
         while True:

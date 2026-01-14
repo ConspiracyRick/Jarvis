@@ -37,7 +37,13 @@ class AI:
         self.ringlogin_ok = False
         
         self.r = sr.Recognizer()
-        self.mic = sr.Microphone()
+        self.mic = sr.Microphone(sample_rate=16000)
+        
+        # Better defaults for recognition
+        self.r.energy_threshold = 300
+        self.r.dynamic_energy_threshold = True
+        self.r.dynamic_energy_adjustment_damping = 0.15
+        self.r.dynamic_energy_ratio = 1.5
         
         self.config = self.load_config()
         self.user_name = self.config.get("user_name", "Sir")
@@ -53,54 +59,61 @@ class AI:
         self.loaded()
 
     def speak(self, text):
-        engine = pyttsx3.init()  # create a fresh engine each time
-        engine.setProperty('rate', 155)
-        engine.setProperty('volume', 1.0)
-        for v in engine.getProperty('voices'):
-            if 'david' in v.name.lower():
-                engine.setProperty('voice', v.id)
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 158)
+        engine.setProperty('volume', 0.95)
+
+        for voice in engine.getProperty('voices'):
+            if 'david' in voice.name.lower() or 'en-us' in voice.id.lower():
+                engine.setProperty('voice', voice.id)
                 break
+
         engine.say(text)
         engine.runAndWait()
-        engine.stop()  # release resources
-    
-    
-    # ====== BACKGROUND LISTENING ======
-    def start_background_listen(self):
-        # Adjust for ambient noise once at startup
-        with self.mic as source:
-            print("Calibrating microphone for ambient noise...")
-            self.r.adjust_for_ambient_noise(source, duration=3)
-            self.r.dynamic_energy_threshold = True
-            print("Calibration done!")
+        del engine  # force cleanup
 
-        # Define the callback for background listening
+    def calibrate_microphone(self):
+        print("Calibrating microphone (keep quiet for ~4-5 seconds)...")
+        with self.mic as source:
+            self.r.adjust_for_ambient_noise(source, duration=4.5)
+        print("Microphone calibration finished.")
+
+    def start_background_listening(self):
+        self.calibrate_microphone()
+
         def callback(recognizer, audio):
             try:
-                q = recognizer.recognize_google(audio)
-                print(f"You: {q}")
-                if "jarvis" in q.lower():
-                    cmd = q.lower().replace("jarvis", "").strip()
-                    if cmd:
-                        self.respond(cmd)
-                    else:
+                text = recognizer.recognize_google(audio, language="en-US")
+                text = text.strip()
+                print(f"HEARD: {text}")
+
+                text_lower = text.lower()
+
+                if "jarvis" in text_lower:
+                    # Clean command - remove wake word
+                    command = re.sub(r'^jarvis\s+', '', text_lower, flags=re.IGNORECASE).strip()
+
+                    if not command:
                         self.speak("Yes, Sir?")
+                    else:
+                        print(f" → Command: {command}")
+                        self.respond(command)
+
             except sr.UnknownValueError:
-                # Could not understand audio, ignore
                 pass
             except Exception as e:
-                print(f"Speech recognition error: {e}")
+                print(f"Background recognition error: {type(e).__name__}: {e}")
 
-        # Start background listening
-        self.background_listening = self.r.listen_in_background(
-            self.mic, callback, phrase_time_limit=20
+        print("\nJarvis background listening started...")
+        self.stop_listening = self.r.listen_in_background(
+            self.mic,
+            callback,
+            phrase_time_limit=12
         )
-        print("Jarvis is now listening in the background...")
 
-    # ====== STOP BACKGROUND LISTENING ======
-    def stop_background_listen(self):
-        if self.background_listening:
-            self.background_listening(wait_for_stop=False)
+    def stop_background_listening(self):
+        if hasattr(self, 'stop_listening'):
+            self.stop_listening(wait_for_stop=False)
             print("Background listening stopped.")
     
     def load_config(self):
@@ -450,42 +463,54 @@ class AI:
             print("Partial systems online.")
             self.speak("Systems partially operational.")
         
-    def respond(self, q):
-        q = q.lower()
-        # === LEVITON LIGHTS ===
-        if self.handle_leviton_command(q):
+    # ================== MAIN COMMAND HANDLER ==================
+    def respond(self, command: str):
+        command = command.lower().strip()
+
+        if self.handle_leviton_command(command):
             return
-        
-        # === RING CAMERAS ===
-        keywords = {"live", "stream", "show"}
-        if any(kw in q.lower() for kw in keywords):
-            if self.handle_ring(q):
-                return     
-            
-        if "how are you" in q:
-            print("Fully operational, Sir.")
-            self.speak("Fully operational, Sir.")
-        elif "time" in q:
+
+        if any(word in command for word in ["live", "stream", "show", "view", "snapshot"]):
+            if self.handle_ring(command):
+                return
+
+        if "time" in command or "what time" in command:
             t = datetime.datetime.now().strftime("%I:%M %p")
-            print(f"It is {t}.")
-            self.speak(f"It is {t}.")
-        elif "good night" in q:
+            self.speak(f"It's {t}")
+            return
+
+        if any(x in command for x in ["how are you", "status", "systems"]):
+            self.speak("Fully operational, Sir.")
+            return
+
+        if any(x in command for x in ["good night", "shutdown", "sleep", "bye"]):
             self.speak("Good night, Sir.")
-            exit()
-        else:
-            self.web_fallback_answer(q)
+            self.stop_background_listening()
+            sys.exit(0)
+
+        # Fallback - web/general answer (you can expand this)
+        self.speak("I'm not sure how to help with that yet, Sir.")
+
+    def loaded(self):
+        print(f"\nWelcome back, {self.user_name}.")
+        self.speak(f"Welcome back, {self.user_name}.")
+
+        print("Status:")
+        print(f"  Leviton:  {'✓' if self.leviton_switches else '✗'}")
+        print(f"  Ring:     {'✓' if self.ring_devices else '✗'}")
 
     def run(self):
-        while True:
-            text = self.listen()
-            if "jarvis" in text.lower():
-                cmd = text.lower().replace("jarvis", "").strip()
-                if cmd:
-                    self.respond(cmd)
-                else:
-                    self.speak("Yes, Sir?")
+        print("Jarvis starting (improved background listening)...")
+        self.start_background_listening()
+
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            self.stop_background_listening()
+            print("Goodbye.")
 
 if __name__ == "__main__":
     print("Starting......")
     AI().run()
-

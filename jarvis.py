@@ -12,6 +12,9 @@ import re
 import urllib.parse
 from bs4 import BeautifulSoup
 import webbrowser
+from num2words import num2words
+import numpy as np
+import sounddevice as sd
 
 # === Leviton ===
 try:
@@ -485,3 +488,4 @@ class AI:
 if __name__ == "__main__":
     print("Starting......")
     AI().run()
+
